@@ -457,6 +457,12 @@ func (s *Session) Start(command string) error {
 		}
 	}
 
+	// Enable pipe-pane to log output for event-driven status detection
+	if err := s.EnablePipePane(); err != nil {
+		// Non-fatal: status detection will fall back to polling
+		debugLog("Warning: failed to enable pipe-pane for %s: %v", s.Name, err)
+	}
+
 	return nil
 }
 
@@ -464,6 +470,35 @@ func (s *Session) Start(command string) error {
 func (s *Session) Exists() bool {
 	cmd := exec.Command("tmux", "has-session", "-t", s.Name)
 	return cmd.Run() == nil
+}
+
+// EnablePipePane enables tmux pipe-pane to stream output to a log file
+// This is used for event-driven status detection via fsnotify
+func (s *Session) EnablePipePane() error {
+	logFile := s.LogFile()
+
+	// Ensure log directory exists
+	logDir := filepath.Dir(logFile)
+	if err := os.MkdirAll(logDir, 0755); err != nil {
+		return fmt.Errorf("failed to create log dir: %w", err)
+	}
+
+	// Enable pipe-pane: stream pane output to log file
+	cmd := exec.Command("tmux", "pipe-pane", "-t", s.Name, "-o", fmt.Sprintf("cat >> '%s'", logFile))
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("failed to enable pipe-pane: %w", err)
+	}
+
+	return nil
+}
+
+// DisablePipePane disables pipe-pane logging
+func (s *Session) DisablePipePane() error {
+	cmd := exec.Command("tmux", "pipe-pane", "-t", s.Name)
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("failed to disable pipe-pane for %s: %w", s.Name, err)
+	}
+	return nil
 }
 
 // EnableMouseMode enables mouse scrolling, clipboard integration, and optimal settings
