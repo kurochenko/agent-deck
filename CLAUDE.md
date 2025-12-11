@@ -48,6 +48,34 @@ tail -500 ~/.agent-deck/logs/agentdeck_<session-name>_<id>.log
 - Logs persist even when tmux sessions are killed
 - Use these to recover conversation history
 
+### Test Isolation (CRITICAL)
+
+**⚠️ 2025-12-11 Incident (Test Data Loss):**
+Tests ran with `AGENTDECK_PROFILE=work` in environment, causing `TestHomeRenameSessionComplete` to overwrite ALL 36 production sessions with a single test session ("new-name" in "tmp" group).
+
+**Root Cause:** Tests used `NewHome()` which creates real storage. With `AGENTDECK_PROFILE=work` set, storage wrote to production `~/.agent-deck/profiles/work/sessions.json`.
+
+**Fix Applied:**
+1. **TestMain in all packages** - Sets `AGENTDECK_PROFILE=_test` before tests run
+2. **Storage safeguard** - Detects test mode and forces `_test` profile if production profile detected
+3. **Test isolation** - All test data now goes to `~/.agent-deck/profiles/_test/`
+
+**Files Added:**
+- `internal/ui/testmain_test.go`
+- `internal/session/testmain_test.go`
+- `internal/tmux/testmain_test.go`
+- `cmd/agent-deck/testmain_test.go`
+
+**Safeguard in `storage.go`:**
+```go
+// If tests running with production profile, force _test profile
+if isTestMode() && isProductionProfile(effectiveProfile) {
+    effectiveProfile = TestProfileName // "_test"
+}
+```
+
+**NEVER run tests without this protection in place!**
+
 ---
 
 ## Quick Start
@@ -169,10 +197,47 @@ internal/
 - Session must have a valid `lastSessionId` in Claude's config
 
 **Configuration:**
-If using a custom Claude profile (e.g., dual account setup), set in `~/.agent-deck/config.toml`:
+Set Claude options in `~/.agent-deck/config.toml`:
 ```toml
 [claude]
-config_dir = "~/.claude-work"
+config_dir = "~/.claude-work"  # Custom profile (e.g., dual account setup)
+dangerous_mode = true          # Enable --dangerously-skip-permissions for forked sessions
+```
+
+### Fork Session Architecture
+
+**Two-Path Approach:**
+
+| Session Type | UUID Assignment | Method |
+|--------------|-----------------|--------|
+| **NEW Claude sessions** | Pre-assigned at creation | `--session-id <uuid>` flag |
+| **FORKED sessions** | Detected after start | `findActiveSessionID()` with retry |
+
+**Why Two Paths?**
+- Claude Code's `--session-id` flag CANNOT be combined with `--resume` or `--fork-session`
+- New sessions: We generate UUID upfront, pass via `--session-id` = bulletproof
+- Forks: We let Claude create new session, then detect it = requires waiting
+
+**Key Functions:**
+| Function | File | Purpose |
+|----------|------|---------|
+| `NewInstanceWithTool()` | instance.go:65 | Creates session with pre-assigned UUID if tool=claude |
+| `buildClaudeCommand()` | instance.go:122 | Injects `--session-id` into command |
+| `CreateForkedInstance()` | instance.go:436 | Creates fork WITHOUT `--session-id` |
+| `WaitForClaudeSession()` | instance.go:275 | Polls for new session file after fork |
+| `findActiveSessionID()` | claude.go:78 | Finds most recently modified session file |
+
+**Fork Flow Sequence:**
+```
+1. User presses 'f' or 'F' on Claude session
+2. CreateForkedInstance() called:
+   - Returns command: "claude --resume PARENT_ID --fork-session"
+   - Returns new Instance with empty ClaudeSessionID
+3. inst.Start() → tmux session created, Claude starts
+4. WaitForClaudeSession(3s) → polls for new session file
+5. Claude creates NEW_UUID.jsonl file
+6. Detection finds file, sets ClaudeSessionID = NEW_UUID
+7. Forked session now has valid session ID, can be forked again
 ```
 
 ### Group Actions
@@ -265,6 +330,11 @@ type Instance struct {
 Optional TOML config for custom tools and preferences:
 
 ```toml
+# Claude Code integration
+[claude]
+config_dir = "~/.claude-work"  # Custom Claude profile (optional)
+dangerous_mode = true          # Enable --dangerously-skip-permissions (default: false)
+
 # Custom tool definitions
 [tools.my-ai]
 command = "my-ai-assistant"
@@ -277,11 +347,15 @@ icon = "🤖"
 busy_patterns = ["Generating..."]
 ```
 
-| Field | Description |
-|-------|-------------|
-| `command` | Shell command to run the tool |
-| `icon` | Emoji/symbol shown in TUI |
-| `busy_patterns` | Strings that indicate tool is processing |
+| Section | Field | Description |
+|---------|-------|-------------|
+| `[claude]` | `config_dir` | Path to Claude's config directory (default: ~/.claude) |
+| `[claude]` | `dangerous_mode` | Enable `--dangerously-skip-permissions` flag (default: false) |
+| `[tools.*]` | `command` | Shell command to run the tool |
+| `[tools.*]` | `icon` | Emoji/symbol shown in TUI |
+| `[tools.*]` | `busy_patterns` | Strings that indicate tool is processing |
+
+**Note:** `dangerous_mode = false` (default) means Claude will ask for permission before executing commands. Set to `true` to bypass permission prompts.
 
 ## UI Layout
 
